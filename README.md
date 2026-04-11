@@ -6,6 +6,7 @@ This tool only supports wired networks; scanning wireless networks is meaningles
 If you have any suggestions or feedback, please contact me.   
 >QQ:2874454570
 >>Email:regeditexe@outlook.com
+
     
 一个帮助你检查互联网的工具    
 这个程序启动需要十多秒，这是正常的。它正在提升权限，否则扫描将无法进行。    

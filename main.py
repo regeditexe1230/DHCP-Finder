@@ -1154,9 +1154,68 @@ class DHCPScanner:
         self.result_text.config(state=tk.DISABLED)
         self.root.update_idletasks()
 
+def check_npcap_installed():
+    """检查npcap是否已安装"""
+    if platform.system() != 'Windows':
+        return True
+    
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\npcap")
+        winreg.CloseKey(key)
+        return True
+    except WindowsError:
+        pass
+    
+    try:
+        npcap_path = r"C:\Windows\System32\Npcap"
+        if os.path.exists(npcap_path):
+            return True
+    except:
+        pass
+    
+    return False
+
+def install_npcap():
+    """运行npcap安装程序"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    npcap_installer = os.path.join(script_dir, "npcap-1.87.exe")
+    
+    if os.path.exists(npcap_installer):
+        try:
+            import ctypes
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                None, "open", npcap_installer, None, script_dir, 1
+            )
+            if ret > 32:
+                return True
+        except Exception as e:
+            print(f"运行npcap安装程序失败: {e}")
+    return False
+
 def main():
     # 检查系统
     system = platform.system()
+
+    # npcap检查(仅Windows)
+    if system == 'Windows':
+        if not check_npcap_installed():
+            result = messagebox.askyesno(
+                "Npcap未安装",
+                "Npcap是本程序运行的必要组件。\n\n是否立即安装Npcap?"
+            )
+            if result:
+                if install_npcap():
+                    messagebox.showinfo(
+                        "提示",
+                        "Npcap安装程序已启动。\n\n请完成安装后重新运行本程序。"
+                    )
+                else:
+                    messagebox.showerror(
+                        "错误",
+                        "无法启动Npcap安装程序。\n请手动运行同目录下的 npcap-1.87.exe"
+                    )
+            sys.exit(0)
 
     # 管理员权限运行
     try:
@@ -1177,8 +1236,7 @@ def main():
             import scapy
             import netifaces
         except ImportError as e:
-            print(f"缺少必要的库: {e}")
-            print("请安装: pip install scapy netifaces")
+
             return
 
         # 主窗口
@@ -1193,4 +1251,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

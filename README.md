@@ -9,8 +9,8 @@ This software cannot be used in certain network environments:
 >2. The static IP you set on your computer is not within your router's address pool
     
 If you have any suggestions or feedback, please contact me    
->QQ:2874454570
->Email:regeditexe@outlook.com
+>QQ:2874454570      
+>Email:regeditexe@outlook.com      
 
     
 一个帮助你检查互联网的工具    
@@ -18,9 +18,9 @@ If you have any suggestions or feedback, please contact me
 这个工具只支持有线网络，无线网络扫了没意义   
     
 这个软件在特定网络环境下用不了：       
->1.你的电脑使用了静态ip
+>1.你的电脑使用了静态ip      
 >2.你电脑设定的静态ip不在你路由器的地址池中
     
 如果你有任何建议或者反馈请联系我    
->QQ:2874454570
->Email:regeditexe@outlook.com
+>QQ:2874454570      
+>Email:regeditexe@outlook.com      

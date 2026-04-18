@@ -6,11 +6,11 @@ This tool only supports wired networks; scanning wireless networks is meaningles
     
 This software cannot be used in certain network environments:    
 >1. Your computer is using a static IP
->>2. The static IP you set on your computer is not within your router's address pool
+>2. The static IP you set on your computer is not within your router's address pool
     
 If you have any suggestions or feedback, please contact me    
 >QQ:2874454570
->>Email:regeditexe@outlook.com
+>Email:regeditexe@outlook.com
 
     
 一个帮助你检查互联网的工具    

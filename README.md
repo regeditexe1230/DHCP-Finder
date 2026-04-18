@@ -19,8 +19,8 @@ If you have any suggestions or feedback, please contact me
     
 这个软件在特定网络环境下用不了：       
 >1.你的电脑使用了静态ip
->>2.你电脑设定的静态ip不在你路由器的地址池中
+>2.你电脑设定的静态ip不在你路由器的地址池中
     
 如果你有任何建议或者反馈请联系我    
 >QQ:2874454570
->>Email:regeditexe@outlook.com
+>Email:regeditexe@outlook.com

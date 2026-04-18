@@ -1,20 +1,52 @@
+import os
+import sys
+import platform
+import shutil
+import glob
+
+if platform.system() == 'Linux':
+    uid = os.getuid()
+    if 'WAYLAND_RUNTIME_DIR' not in os.environ:
+        wlr_dir = f'/run/user/{uid}'
+        if os.path.exists(wlr_dir):
+            os.environ['WAYLAND_RUNTIME_DIR'] = wlr_dir
+    if 'XDG_RUNTIME_DIR' not in os.environ:
+        xdg_dir = f'/run/user/{uid}'
+        if os.path.exists(xdg_dir):
+            os.environ['XDG_RUNTIME_DIR'] = xdg_dir
+    if 'WAYLAND_DISPLAY' not in os.environ and 'DISPLAY' not in os.environ:
+        for name in ['wayland-0', 'wayland-1', 'wayland-2']:
+            socket_path = f'/run/user/{uid}/{name}'
+            if os.path.exists(socket_path):
+                os.environ['WAYLAND_DISPLAY'] = name
+                break
+        if 'WAYLAND_DISPLAY' not in os.environ:
+            x11_dir = '/tmp/.X11-unix'
+            if os.path.exists(x11_dir):
+                x11_sockets = sorted([f for f in os.listdir(x11_dir) if f.startswith('X')])
+                if x11_sockets:
+                    os.environ['DISPLAY'] = f':{x11_sockets[0][1:]}'
+                    if 'XAUTHORITY' not in os.environ:
+                        home = os.path.expanduser('~')
+                        xauth_file = os.path.join(home, '.Xauthority')
+                        if os.path.exists(xauth_file):
+                            os.environ['XAUTHORITY'] = xauth_file
+
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox
 import socket
 import struct
 import threading
 import time
+import random
+import queue
 import netifaces
 from scapy.all import *
-import ipaddress
-import platform
-import configparser
-import os
-import sys
 import json
 import ctypes
 import subprocess
 
+# ---------------------------- 国际化文本 ---------------------------------
 LANG = {
     'zh': {
         'title': 'DHCP扫描器',
@@ -166,31 +198,34 @@ LANG = {
     }
 }
 
+# ---------------------------- 辅助函数 ---------------------------------
+def get_windows_theme():
+    if platform.system() != 'Windows':
+        return None
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return 'dark' if value == 0 else 'light'
+    except:
+        return 'light'
+
 def request_admin():
-    """请求管理员权限 - 跨平台支持"""
     system = platform.system()
     python_exe = sys.executable
-    
     if system == 'Windows':
         try:
-            import ctypes
             is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
             if not is_admin:
                 script = os.path.abspath(sys.argv[0])
                 script_dir = os.path.dirname(script)
-                
-                ret = ctypes.windll.shell32.ShellExecuteW(
-                    None, "runas", python_exe, f'"{script}"', script_dir, 1
-                )
-                
+                ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", python_exe, f'"{script}"', script_dir, 1)
                 if ret <= 32:
-                    print(f"Windows管理员请求失败，错误码: {ret}")
                     return False
                 sys.exit(0)
-        except Exception as e:
-            print(f"Windows管理员请求失败: {e}")
+        except:
             return False
-            
     elif system == 'Darwin':
         is_admin = os.geteuid() == 0
         if not is_admin:
@@ -198,49 +233,77 @@ def request_admin():
             params = ' '.join([f'"{arg}"' for arg in sys.argv[1:]])
             try:
                 cmd = f'''tell application "Terminal"
-                    do script "clear
-echo '╔════════════════════════════════════════╗'
-echo '║       DHCP服务器扫描器 - 权限提升      ║'
-echo '╚════════════════════════════════════════╝'
-echo ''
-echo '>>> 正在请求管理员权限...'
-echo '>>> 请在下方输入您的登录密码'
-echo '>>> '
-sudo \\"{python_exe}\\" \\"{script}\\" {params}
-sleep 1
-tell application \\"Terminal\\" to quit"
+                    activate
+                    set newTab to do script ""
+                    delay 0.3
+                    do script "clear && echo '╔════════════════════════════════════════╗' && echo '║       DHCP服务器扫描器 - 权限提升      ║' && echo '╚════════════════════════════════════════╝' && echo '' && echo '>>> 正在请求管理员权限...' && echo '>>> 请在下方输入您的登录密码' && echo '>>> ' && sudo \\"{python_exe}\\" \\"{script}\\" {params}" in newTab
                 end tell'''
-                result = subprocess.run(['osascript', '-e', cmd], capture_output=True, text=True)
-                if result.returncode == 0:
-                    sys.exit(0)
-                else:
-                    print(f"macOS管理员请求失败: {result.stderr}")
-            except Exception as e:
-                print(f"macOS管理员请求失败: {e}")
-            return False
-                
+                subprocess.run(['osascript', '-e', cmd], capture_output=True, text=True)
+                sys.exit(0)
+            except:
+                return False
     elif system == 'Linux':
         is_admin = os.geteuid() == 0
         if not is_admin:
             script = os.path.abspath(sys.argv[0])
-            try:
-                result = subprocess.run(['pkexec', python_exe, script] + sys.argv[1:],
-                                      capture_output=True, text=True)
-                sys.exit(result.returncode)
-            except Exception as e:
-                try:
-                    result = subprocess.run(['sudo', python_exe, script] + sys.argv[1:],
-                                          capture_output=True, text=True)
-                    sys.exit(result.returncode)
-                except Exception as e2:
-                    print(f"Linux管理员请求失败: {e2}")
-                    return False
+            env = os.environ.copy()
+            if 'DISPLAY' in env:
+                subprocess.run(['xhost', 'si:localuser:root'], capture_output=True)
+            dbus_addr = env.get('DBUS_SESSION_BUS_ADDRESS')
+            if not dbus_addr:
+                uid = os.getuid()
+                for pattern in [f'/run/user/{uid}/bus', f'/tmp/dbus-*/{uid}']:
+                    matches = glob.glob(pattern)
+                    if matches:
+                        env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={matches[0]}'
+                        break
+            pkexec_path = shutil.which('pkexec')
+            if pkexec_path:
+                os.execve(pkexec_path, ['pkexec', '--keep-cwd', python_exe, script] + sys.argv[1:], env)
+            return False
     return True
 
+def build_dhcp_packet(msg_type, mac, xid=None, ciaddr='0.0.0.0', yiaddr='0.0.0.0',
+                      siaddr='0.0.0.0', giaddr='0.0.0.0', options_extra=None):
+    """
+    构建标准的 DHCP 包（原始字节流）
+    msg_type: 1=Discover, 3=Request, 8=Inform
+    """
+    if xid is None:
+        xid = random.randint(1, 0xFFFFFFFF)
+    mac_bytes = bytes.fromhex(mac.replace(':', ''))
+    # BOOTP header
+    bootp = struct.pack('!BBBB', 1, 1, 6, 0)  # op, htype, hlen, hops
+    bootp += struct.pack('!I', xid)           # xid
+    bootp += struct.pack('!H', 0)             # secs
+    bootp += struct.pack('!H', 0x8000 if msg_type == 1 else 0)  # flags (broadcast for Discover)
+    bootp += socket.inet_aton(ciaddr)         # ciaddr
+    bootp += socket.inet_aton(yiaddr)         # yiaddr
+    bootp += socket.inet_aton(siaddr)         # siaddr
+    bootp += socket.inet_aton(giaddr)         # giaddr
+    bootp += mac_bytes + b'\x00' * (16 - len(mac_bytes))  # chaddr
+    bootp += b'\x00' * 64                     # sname
+    bootp += b'\x00' * 128                    # file
+    bootp += b'\x63\x82\x53\x63'              # magic cookie
+    # DHCP options
+    options = b''
+    options += bytes([53, 1, msg_type])       # DHCP message type
+    options += bytes([61, 7, 1]) + mac_bytes  # Client identifier
+    if options_extra:
+        options += options_extra
+    options += b'\xff'                        # End option
+    # 总长度至少 312 字节
+    packet = bootp + options
+    if len(packet) < 312:
+        packet += b'\x00' * (312 - len(packet))
+    return packet
+
+# ---------------------------- 主程序类 ---------------------------------
 class DHCPScanner:
     def __init__(self, root):
         self.root = root
         self.root.attributes('-alpha', 0.95)
+        self.is_dark_theme = get_windows_theme()
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
         if platform.system() == 'Windows':
@@ -253,48 +316,35 @@ class DHCPScanner:
                 from tkinter import PhotoImage
                 icon = PhotoImage(file=png_path)
                 self.root.iconphoto(True, icon)
-            except Exception as e:
-                print(f"设置图标失败: {e}")
+            except:
+                pass
 
-        # 配置文件路径
         self.config_file = "dhcp_scanner_config.json"
-
-        # 加载配置
         self.config = self.load_config()
-
-        # 语言设置
         self.current_lang = self.config.get('language', 'zh')
-
-        # 设置窗口大小（根据配置调整）
         window_width = self.config.get('window_width', 700)
         window_height = self.config.get('window_height', 800)
         self.root.geometry(f"{window_width}x{window_height}")
 
-        # 系统检测
         self.system = platform.system()
         self.is_mac = self.system == 'Darwin'
         self.is_linux = self.system == 'Linux'
 
-        # 扫描状态
         self.is_scanning = False
         self.scan_thread = None
-        self.dhcp_servers = []
+        self.dhcp_servers = {}   # {ip: {'method': str, 'options': dict}}
+        self.local_ips = set(['127.0.0.1', '0.0.0.0'])  # 本机IP集合，用于过滤
+        self.sniff_thread = None  # 后台嗅探线程
+        self.stop_event = None    # 嗅探线程停止事件
 
-        # 创建UI
         self.create_ui()
-
-        # 绑定窗口关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-
-        # 绑定窗口大小变化事件
         self.root.bind("<Configure>", self.on_window_resize)
 
     def t(self, key):
-        """获取翻译"""
         return LANG[self.current_lang].get(key, key)
 
     def toggle_language(self):
-        """切换语言"""
         self.current_lang = self.lang_var.get()
         self.config['language'] = self.current_lang
         self.save_config()
@@ -303,279 +353,196 @@ class DHCPScanner:
         self.restore_last_interface()
 
     def update_ui_text(self):
-        """更新UI文本"""
         self.root.title(self.t('title'))
-        
-        # 更新系统信息
+        if hasattr(self, 'lang_label'):
+            self.lang_label.config(text="语言/language")
         system_info = f"{self.t('system_info')}: {self.system}"
         if self.is_mac:
             system_info += " (macOS)"
         elif self.is_linux:
             system_info += " (Linux)"
         self.system_label.config(text=system_info)
-        
-        # 更新配置信息
         self.config_label.config(text=f"{self.t('config')}: {self.t('scan_count')}={self.config['scan_count']}, {self.t('timeout')}={self.config['timeout']}")
-        
-        # 更新网卡列表标签
         self.interfaces_label.config(text=self.t('available_interfaces') + ":")
-        
-        # 更新Treeview列标题
         self.interface_tree.heading('interface', text=self.t('interface_name'))
         self.interface_tree.heading('ip', text=self.t('ip'))
         self.interface_tree.heading('mac', text=self.t('mac'))
         self.interface_tree.heading('status', text=self.t('status'))
-        
-        # 更新按钮文本
         self.refresh_btn.config(text=self.t('refresh'))
         self.auto_select_btn.config(text=self.t('auto_select'))
         self.selection_label.config(text=self.t('current_selection') + ":")
-        
-        # 更新扫描参数标签
         self.scan_count_label.config(text=self.t('scan_count') + ":")
         self.timeout_label.config(text=self.t('timeout') + ":")
-        
-        # 更新操作按钮
         self.save_btn.config(text=self.t('save_settings'))
         self.scan_btn.config(text=self.t('start_scan'))
         self.stop_btn.config(text=self.t('stop_scan'))
-        
-        # 更新结果统计标签
         self.server_count_label.config(text=self.t('dhcp_server_count') + ":")
         self.state_label.config(text=self.t('state') + ":")
-        
-        # 更新使用说明
         self.usage_label.config(text=self.t('usage') + ": " + self.t('usage_text'))
-        
-        # 更新状态
         self.status_var.set(self.t('ready'))
         self.selected_interface_var.set(self.t('not_selected'))
 
     def load_config(self):
-        """加载配置文件"""
         default_config = {
-            'scan_count': 3,
-            'timeout': 5,
-            'window_width': 700,
-            'window_height': 800,
-            'last_interface': '',
-            'language': 'zh'
+            'scan_count': 3, 'timeout': 5, 'window_width': 700, 'window_height': 800,
+            'last_interface': '', 'language': 'zh'
         }
-
         try:
             if os.path.exists(self.config_file):
                 with open(self.config_file, 'r') as f:
                     config = json.load(f)
-                    # 合并默认配置和保存的配置
-                    for key, value in default_config.items():
-                        if key not in config:
-                            config[key] = value
-                    return config
-            else:
-                return default_config
-        except Exception as e:
-            print(f"加载配置文件出错: {e}")
-            return default_config
+                for k, v in default_config.items():
+                    if k not in config:
+                        config[k] = v
+                return config
+        except:
+            pass
+        return default_config
 
     def save_config(self):
-        """保存配置到文件"""
         try:
             with open(self.config_file, 'w') as f:
                 json.dump(self.config, f, indent=4)
             return True
-        except Exception as e:
-            print(f"保存配置文件出错: {e}")
+        except:
             return False
 
     def on_window_resize(self, event):
-        """窗口大小变化时保存配置"""
         if event.widget == self.root:
-            width = event.width
-            height = event.height
-            # 只在窗口大小显著变化时保存，避免频繁写入
-            if abs(width - self.config.get('window_width', 700)) > 20 or \
-               abs(height - self.config.get('window_height', 800)) > 20:
-                self.config['window_width'] = width
-                self.config['window_height'] = height
-                # 延迟保存，避免频繁写入
+            w, h = event.width, event.height
+            if abs(w - self.config.get('window_width', 700)) > 20 or abs(h - self.config.get('window_height', 800)) > 20:
+                self.config['window_width'] = w
+                self.config['window_height'] = h
                 if hasattr(self, 'save_timer'):
                     self.root.after_cancel(self.save_timer)
                 self.save_timer = self.root.after(1000, self.save_config)
 
     def on_closing(self):
-        """窗口关闭时保存配置"""
-        # 保存当前配置
         self.config['scan_count'] = self.scan_count_var.get()
         self.config['timeout'] = self.timeout_var.get()
-
-        # 保存选中的网卡
-        interface = self.get_selected_interface()
-        if interface:
-            self.config['last_interface'] = interface
-
+        iface = self.get_selected_interface()
+        if iface:
+            self.config['last_interface'] = iface
         self.save_config()
         self.root.destroy()
 
     def create_ui(self):
-        self.root.title(self.t('title'))
-        
-        # 主框架
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # 语言选择区域
+        # 语言选择
         lang_frame = ttk.LabelFrame(main_frame, padding="5")
-        lang_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-
+        lang_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0,10))
         self.lang_var = tk.StringVar(value=self.current_lang)
-        ttk.Label(lang_frame, text="语言/language").pack(side=tk.LEFT, padx=(5, 10))
-        ttk.Radiobutton(lang_frame, text="中文", variable=self.lang_var, value='zh', command=self.toggle_language).pack(side=tk.LEFT, padx=(0, 5))
+        self.lang_label = ttk.Label(lang_frame, text="语言/language")
+        self.lang_label.pack(side=tk.LEFT, padx=(5,10))
+        ttk.Radiobutton(lang_frame, text="中文", variable=self.lang_var, value='zh', command=self.toggle_language).pack(side=tk.LEFT, padx=(0,5))
         ttk.Radiobutton(lang_frame, text="English", variable=self.lang_var, value='en', command=self.toggle_language).pack(side=tk.LEFT)
 
-        # 系统信息区域
+        # 系统信息
         system_frame = ttk.LabelFrame(main_frame, padding="10")
-        system_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-
-        system_info = f"{self.t('system_info')}: {self.system}"
-        if self.is_mac:
-            system_info += " (macOS)"
-        elif self.is_linux:
-            system_info += " (Linux)"
-
-        self.system_label = ttk.Label(system_frame, text=system_info)
+        system_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0,10))
+        self.system_label = ttk.Label(system_frame)
         self.system_label.grid(row=0, column=0, sticky=tk.W)
-
-        # 配置信息
         self.config_label = ttk.Label(system_frame, foreground="blue")
         self.config_label.grid(row=0, column=1, sticky=tk.E)
 
-        # 网卡选择区域
+        # 网卡选择
         network_frame = ttk.LabelFrame(main_frame, padding="10")
-        network_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-
-        # 网卡列表
+        network_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0,10))
         self.interfaces_label = ttk.Label(network_frame)
         self.interfaces_label.grid(row=0, column=0, sticky=tk.W)
-
-        # 多列显示
         columns = ('interface', 'ip', 'mac', 'status')
         self.interface_tree = ttk.Treeview(network_frame, columns=columns, show='headings', height=5)
-
-        # 设置列
         self.interface_tree.heading('interface', text=self.t('interface_name'))
         self.interface_tree.heading('ip', text=self.t('ip'))
         self.interface_tree.heading('mac', text=self.t('mac'))
         self.interface_tree.heading('status', text=self.t('status'))
-
         self.interface_tree.column('interface', width=120)
         self.interface_tree.column('ip', width=120)
         self.interface_tree.column('mac', width=120)
         self.interface_tree.column('status', width=80)
-
-        self.interface_tree.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(5, 5))
-
-        # 滚动条
+        self.interface_tree.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(5,5))
         scrollbar = ttk.Scrollbar(network_frame, orient=tk.VERTICAL, command=self.interface_tree.yview)
         scrollbar.grid(row=1, column=2, sticky=(tk.N, tk.S))
         self.interface_tree.configure(yscrollcommand=scrollbar.set)
 
-        # 按钮
         button_frame = ttk.Frame(network_frame)
-        button_frame.grid(row=2, column=0, columnspan=3, pady=(5, 0))
-
+        button_frame.grid(row=2, column=0, columnspan=3, pady=(5,0))
         self.refresh_btn = ttk.Button(button_frame, command=self.load_interfaces)
-        self.refresh_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.refresh_btn.pack(side=tk.LEFT, padx=(0,5))
         self.auto_select_btn = ttk.Button(button_frame, command=self.auto_select_interface)
-        self.auto_select_btn.pack(side=tk.LEFT, padx=(5, 5))
-
-        # 当前选择
+        self.auto_select_btn.pack(side=tk.LEFT, padx=(5,5))
         self.selected_interface_var = tk.StringVar(value=self.t('not_selected'))
         self.selection_label = ttk.Label(button_frame)
-        self.selection_label.pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Label(button_frame, textvariable=self.selected_interface_var,
-                 font=("Arial", 10, "bold"), foreground="blue").pack(side=tk.LEFT, padx=(5, 0))
+        self.selection_label.pack(side=tk.LEFT, padx=(10,0))
+        ttk.Label(button_frame, textvariable=self.selected_interface_var, font=("Arial",10,"bold"), foreground="blue").pack(side=tk.LEFT, padx=(5,0))
 
         # 扫描控制
         control_frame = ttk.LabelFrame(main_frame, padding="10")
-        control_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-
-        # 扫描参数
+        control_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0,10))
         param_frame = ttk.Frame(control_frame)
-        param_frame.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 5))
-
+        param_frame.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0,5))
         self.scan_count_label = ttk.Label(param_frame)
         self.scan_count_label.pack(side=tk.LEFT)
         self.scan_count_var = tk.IntVar(value=self.config['scan_count'])
-        scan_count_spin = ttk.Spinbox(param_frame, from_=1, to=10,
-                                     textvariable=self.scan_count_var, width=8)
-        scan_count_spin.pack(side=tk.LEFT, padx=(5, 20))
-
+        self.scan_count_spin = ttk.Spinbox(param_frame, from_=1, to=10, textvariable=self.scan_count_var, width=8)
+        self.scan_count_spin.pack(side=tk.LEFT, padx=(5,20))
         self.timeout_label = ttk.Label(param_frame)
         self.timeout_label.pack(side=tk.LEFT)
         self.timeout_var = tk.IntVar(value=self.config['timeout'])
-        timeout_spin = ttk.Spinbox(param_frame, from_=1, to=30,
-                                  textvariable=self.timeout_var, width=8)
-        timeout_spin.pack(side=tk.LEFT, padx=(5, 20))
+        self.timeout_spin = ttk.Spinbox(param_frame, from_=1, to=30, textvariable=self.timeout_var, width=8)
+        self.timeout_spin.pack(side=tk.LEFT, padx=(5,20))
 
-        # 按钮
         action_frame = ttk.Frame(control_frame)
-        action_frame.grid(row=1, column=0, columnspan=2, pady=(10, 0))
-
+        action_frame.grid(row=1, column=0, columnspan=2, pady=(10,0))
         self.save_btn = ttk.Button(action_frame, command=self.save_current_settings)
-        self.save_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.save_btn.pack(side=tk.LEFT, padx=(0,5))
         self.scan_btn = ttk.Button(action_frame, command=self.start_scan)
-        self.scan_btn.pack(side=tk.LEFT, padx=(5, 5))
+        self.scan_btn.pack(side=tk.LEFT, padx=(5,5))
         self.stop_btn = ttk.Button(action_frame, command=self.stop_scan, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT)
 
         # 结果显示
         result_frame = ttk.LabelFrame(main_frame, padding="10")
-        result_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
-
-        # 结果统计
+        result_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0,10))
         stats_frame = ttk.Frame(result_frame)
-        stats_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-
+        stats_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0,10))
         self.server_count_label = ttk.Label(stats_frame)
         self.server_count_label.grid(row=0, column=0, sticky=tk.W)
         self.server_count_var = tk.StringVar(value="0")
-        ttk.Label(stats_frame, textvariable=self.server_count_var,
-                 font=("Arial", 12, "bold"), foreground="red").grid(row=0, column=1, padx=(5, 20))
-
+        ttk.Label(stats_frame, textvariable=self.server_count_var, font=("Arial",12,"bold"), foreground="red").grid(row=0, column=1, padx=(5,20))
         self.state_label = ttk.Label(stats_frame)
         self.state_label.grid(row=0, column=2, sticky=tk.W)
         self.status_var = tk.StringVar(value=self.t('ready'))
-        ttk.Label(stats_frame, textvariable=self.status_var, font=("Arial", 10)).grid(row=0, column=3, padx=(5, 0))
+        ttk.Label(stats_frame, textvariable=self.status_var, font=("Arial",10)).grid(row=0, column=3, padx=(5,0))
 
-        # 结果列表
-        self.result_text = scrolledtext.ScrolledText(result_frame, height=20, width=90)
-        self.result_text.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
+        text_frame = ttk.Frame(result_frame)
+        text_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.result_text = tk.Text(text_frame, height=20, width=90)
+        self.result_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.result_text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.result_text.configure(yscrollcommand=scrollbar.set)
         self.result_text.config(state=tk.DISABLED)
-
-        # 右键菜单
         self.result_text.bind("<Button-3>", self.show_context_menu)
 
-        # 使用说明
         self.usage_label = ttk.Label(main_frame, foreground="gray")
-        self.usage_label.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        self.usage_label.grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(5,0))
 
-        # 配置网格权重 - 关键部分，确保结果区域可伸缩
+        # 权重
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(4, weight=1)  # 结果区域可伸缩
+        main_frame.rowconfigure(5, weight=1)
         result_frame.columnconfigure(0, weight=1)
-        result_frame.rowconfigure(1, weight=1)  # 文本区域可伸缩
+        result_frame.rowconfigure(1, weight=1)
 
-        # 初始化UI文本
         self.update_ui_text()
-
-        # 加载上次选择的网卡
         self.load_interfaces()
         self.restore_last_interface()
 
     def show_context_menu(self, event):
-        """显示右键菜单"""
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label=self.t('copy'), command=self.copy_result_text)
         menu.add_command(label=self.t('clear'), command=self.clear_result_text)
@@ -584,328 +551,267 @@ class DHCPScanner:
         menu.tk_popup(event.x_root, event.y_root)
 
     def copy_result_text(self):
-        """复制结果文本到剪贴板"""
         try:
             text = self.result_text.get(1.0, tk.END)
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
             messagebox.showinfo(self.t('copy'), self.t('copied'))
-        except Exception as e:
-            messagebox.showerror(self.t('error_title'), self.t('copy_failed') + f": {e}")
+        except:
+            messagebox.showerror(self.t('error_title'), self.t('copy_failed'))
 
     def clear_result_text(self):
-        """清空结果文本"""
         if self.is_scanning:
             messagebox.showwarning(self.t('warning'), self.t('cannot_clear'))
             return
-
         self.result_text.config(state=tk.NORMAL)
         self.result_text.delete(1.0, tk.END)
         self.result_text.config(state=tk.DISABLED)
         self.server_count_var.set("0")
 
     def save_result_to_file(self):
-        """保存结果到文件"""
         try:
             text = self.result_text.get(1.0, tk.END)
             if not text.strip():
                 messagebox.showinfo(self.t('saved_success'), self.t('nothing_to_save'))
                 return
-
             filename = f"dhcp_scan_result_{time.strftime('%Y%m%d_%H%M%S')}.txt"
             with open(filename, 'w', encoding='utf-8') as f:
                 f.write(text)
-
             messagebox.showinfo(self.t('saved_success'), self.t('saved') % filename)
-        except Exception as e:
-            messagebox.showerror(self.t('error_title'), self.t('save_failed') + f": {e}")
+        except:
+            messagebox.showerror(self.t('error_title'), self.t('save_failed'))
 
     def save_current_settings(self):
-        """保存当前设置到配置文件"""
         self.config['scan_count'] = self.scan_count_var.get()
         self.config['timeout'] = self.timeout_var.get()
-
-        # 保存选中的网卡
-        interface = self.get_selected_interface()
-        if interface:
-            self.config['last_interface'] = interface
-
+        iface = self.get_selected_interface()
+        if iface:
+            self.config['last_interface'] = iface
         if self.save_config():
             messagebox.showinfo(self.t('saved_success'), self.t('settings_saved'))
-            # 更新系统信息中的配置显示
-            system_frame = self.root.grid_slaves(row=0, column=0)[0].winfo_children()[0]
-            config_label = system_frame.grid_slaves(row=0, column=1)[0]
-            config_label.config(text=f"{self.t('config')}: {self.t('scan_count')}={self.config['scan_count']}, {self.t('timeout')}={self.config['timeout']}")
+            self.update_config_label()
         else:
             messagebox.showerror(self.t('error_title'), self.t('save_failed'))
 
+    def update_config_label(self):
+        self.config_label.config(text=f"{self.t('config')}: {self.t('scan_count')}={self.config['scan_count']}, {self.t('timeout')}={self.config['timeout']}")
+
     def restore_last_interface(self):
-        """恢复上次选择的网卡"""
-        last_interface = self.config.get('last_interface', '')
-        if last_interface:
-            # 检查接口是否在列表中
-            found = False
+        last = self.config.get('last_interface', '')
+        if last:
             for item in self.interface_tree.get_children():
-                if self.interface_tree.item(item)['values'][0] == last_interface:
+                if self.interface_tree.item(item)['values'][0] == last:
                     self.interface_tree.selection_set(item)
                     self.interface_tree.see(item)
                     self.on_interface_select(None)
-                    found = True
                     break
-            # 如果没找到，清除保存的接口
-            if not found:
-                self.config['last_interface'] = ''
-                self.save_config()
 
     def load_interfaces(self):
-        """加载所有网络接口"""
         try:
             interfaces = netifaces.interfaces()
             self.interface_tree.delete(*self.interface_tree.get_children())
-
-            available_interfaces = []
-
-            for interface in interfaces:
-                # 跳过本地回环接口
-                if interface in ['lo', 'lo0', 'lo1']:
+            available = []
+            for iface in interfaces:
+                if iface in ['lo', 'lo0', 'lo1']:
                     continue
-
-                # 获取接口信息
-                addrs = netifaces.ifaddresses(interface)
-                ip_info = addrs.get(netifaces.AF_INET, [{}])[0]
-                mac_info = addrs.get(netifaces.AF_LINK, [{}])[0]
-
-                ip = ip_info.get('addr', 'N/A')
-                mac = mac_info.get('addr', 'N/A')
-
+                addrs = netifaces.ifaddresses(iface)
+                ip = addrs.get(netifaces.AF_INET, [{}])[0].get('addr', 'N/A')
+                mac = addrs.get(netifaces.AF_LINK, [{}])[0].get('addr', 'N/A')
                 status = self.t('active') if ip != 'N/A' else self.t('inactive')
-                available_interfaces.append((interface, ip, mac, status))
-
-            # 自动选择逻辑
-            if len(available_interfaces) == 1:
-                # 只有一个网卡，自动选择
-                interface, ip, mac, status = available_interfaces[0]
-                self.selected_interface_var.set(f"{interface} ({ip})")
-                self.interface_tree.insert('', 'end', values=(interface, ip, mac, status), tags=('selected',))
-                # 滚动到选中项
+                available.append((iface, ip, mac, status))
+            if len(available) == 1:
+                iface, ip, mac, status = available[0]
+                self.selected_interface_var.set(f"{iface} ({ip})")
+                self.interface_tree.insert('', 'end', values=(iface, ip, mac, status), tags=('selected',))
                 self.interface_tree.see(self.interface_tree.get_children()[-1])
             else:
-                # 多个网卡
-                for interface, ip, mac, status in available_interfaces:
-                    self.interface_tree.insert('', 'end', values=(interface, ip, mac, status))
-
-                # 设置选中样式
+                for iface, ip, mac, status in available:
+                    self.interface_tree.insert('', 'end', values=(iface, ip, mac, status))
                 self.interface_tree.tag_configure('selected', background='lightblue')
-
-                # 绑定选择事件
                 self.interface_tree.bind('<<TreeviewSelect>>', self.on_interface_select)
-
-            if not available_interfaces:
+            if not available:
                 messagebox.showwarning(self.t('warning'), self.t('no_interfaces'))
-
         except Exception as e:
-            messagebox.showerror(self.t('error_title'), f"Failed to get network interfaces: {e}")
-            if self.is_mac or self.is_linux:
-                messagebox.showinfo(self.t('usage'), self.t('macos_tip'))
+            messagebox.showerror(self.t('error_title'), f"Failed to get interfaces: {e}")
 
     def on_interface_select(self, event):
-        """网卡选择事件处理"""
-        selection = self.interface_tree.selection()
-        if selection:
-            item = self.interface_tree.item(selection[0])
-            values = item['values']
+        sel = self.interface_tree.selection()
+        if sel:
+            values = self.interface_tree.item(sel[0])['values']
             if values:
-                interface = values[0]
-                ip = values[1]
-                self.selected_interface_var.set(f"{interface} ({ip})")
+                self.selected_interface_var.set(f"{values[0]} ({values[1]})")
 
     def auto_select_interface(self):
-        """自动选择最佳网卡"""
         try:
             interfaces = netifaces.interfaces()
-            best_interface = None
-
-            # 优先级：有线 > 无线 > 其他
-            for interface in interfaces:
-                if interface in ['lo', 'lo0']:
+            best = None
+            for iface in interfaces:
+                if iface in ['lo', 'lo0']:
                     continue
-
-                # 检查是否有IP地址
-                addrs = netifaces.ifaddresses(interface)
+                addrs = netifaces.ifaddresses(iface)
                 if netifaces.AF_INET not in addrs:
                     continue
-
-                # 有线网卡优先级更高
-                if any(prefix in interface.lower() for prefix in ['eth', 'en', 'enp', 'ens', 'enx']):
-                    best_interface = interface
+                if any(p in iface.lower() for p in ['eth','en','enp','ens','enx']):
+                    best = iface
                     break
-                # 无线网卡次
-                elif any(prefix in interface.lower() for prefix in ['wlan', 'wlp', 'wlo', 'wlp']):
-                    if best_interface is None:
-                        best_interface = interface
-
-            # 如果没有找到，选择第一个有IP的
-            if best_interface is None:
-                for interface in interfaces:
-                    addrs = netifaces.ifaddresses(interface)
-                    if netifaces.AF_INET in addrs:
-                        best_interface = interface
+                elif any(p in iface.lower() for p in ['wlan','wlp','wlo']):
+                    if best is None:
+                        best = iface
+            if best is None:
+                for iface in interfaces:
+                    if netifaces.AF_INET in netifaces.ifaddresses(iface):
+                        best = iface
                         break
-
-            if best_interface:
-                # 更新Treeview选中状态
+            if best:
                 for item in self.interface_tree.get_children():
-                    if self.interface_tree.item(item)['values'][0] == best_interface:
+                    if self.interface_tree.item(item)['values'][0] == best:
                         self.interface_tree.selection_set(item)
                         self.interface_tree.see(item)
                         self.on_interface_select(None)
                         break
-
-                messagebox.showinfo(self.t('auto_select'), self.t('auto_selected') % best_interface)
+                messagebox.showinfo(self.t('auto_select'), self.t('auto_selected') % best)
             else:
                 messagebox.showwarning(self.t('warning'), self.t('no_interfaces'))
-
         except Exception as e:
             messagebox.showerror(self.t('error_title'), f"Auto select failed: {e}")
 
     def get_selected_interface(self):
-        """获取选中的网卡"""
-        selection = self.interface_tree.selection()
-        if selection:
-            item = self.interface_tree.item(selection[0])
-            values = item['values']
+        sel = self.interface_tree.selection()
+        if sel:
+            values = self.interface_tree.item(sel[0])['values']
             if values:
                 return values[0]
         return None
 
+    # ---------------------------- 扫描核心 ---------------------------------
     def send_dhcp_discover(self, interface, count=3, timeout=5):
-        """发送DHCP Discover包"""
-        self.dhcp_servers = []
-        found_ips = set()
+        self.dhcp_servers = {}
         sniff_filter = "udp port 67 or udp port 68"
 
+        # 停止旧的嗅探线程
+        if self.sniff_thread and self.sniff_thread.is_alive():
+            if self.stop_event:
+                self.stop_event.set()
+            try:
+                self.sniff_thread.join(timeout=1)
+            except:
+                pass
+        self.sniff_thread = None
+        self.stop_event = None
+
+        # 初始化本机IP集合（避免误报）
+        self.local_ips = set(['127.0.0.1', '0.0.0.0'])
+
         try:
-            valid_interfaces = get_if_list()
-            actual_interface = None
-            
-            if interface in valid_interfaces:
-                actual_interface = interface
-            else:
-                for iface in valid_interfaces:
+            # 确定实际接口名
+            valid = get_if_list()
+            actual_iface = interface if interface in valid else None
+            if not actual_iface:
+                for iface in valid:
                     try:
                         addrs = netifaces.ifaddresses(interface)
-                        mac_info = addrs.get(netifaces.AF_LINK, [{}])[0]
-                        saved_mac = mac_info.get('addr', '')
+                        saved_mac = addrs.get(netifaces.AF_LINK, [{}])[0].get('addr', '')
                         scapy_mac = get_if_hwaddr(iface)
                         if saved_mac and scapy_mac and saved_mac.lower() == scapy_mac.lower():
-                            actual_interface = iface
+                            actual_iface = iface
                             break
                     except:
                         continue
-            
-            if not actual_interface:
+            if not actual_iface:
                 self.update_result(self.t('cannot_find_interface') + "\n")
                 return
-            
-            mac = get_if_hwaddr(actual_interface)
+
+            mac = get_if_hwaddr(actual_iface)
             if not mac:
                 self.update_status(self.t('cannot_get_mac'))
                 return
 
-            self.update_status(self.t('scanning_interface') % (actual_interface, mac))
+            self.update_status(self.t('scanning_interface') % (actual_iface, mac))
             self.update_result(self.t('sending_dhcp') + "\n")
+
+            # 收集本机所有 IP 地址，避免误报
+            try:
+                all_addrs = netifaces.ifaddresses(actual_iface)
+                for addr in all_addrs.get(netifaces.AF_INET, []):
+                    ip = addr.get('addr')
+                    if ip:
+                        self.local_ips.add(ip)
+            except:
+                pass
 
             # 获取本机IP
             local_ip = '0.0.0.0'
             try:
-                addrs = netifaces.ifaddresses(actual_interface)
-                local_ip_info = addrs.get(netifaces.AF_INET, [{}])[0]
-                local_ip = local_ip_info.get('addr', '0.0.0.0')
+                addrs = netifaces.ifaddresses(actual_iface)
+                local_ip = addrs.get(netifaces.AF_INET, [{}])[0].get('addr', '0.0.0.0')
             except:
                 pass
 
-            # 计算可能的网关IP
+            # 候选网关
             gateway_candidates = []
             if local_ip != '0.0.0.0':
-                ip_parts = local_ip.split('.')
-                for last in ['1', '2', '3', '254', '255']:
-                    gw = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.{last}"
-                    gateway_candidates.append(gw)
+                parts = local_ip.split('.')
+                for last in ['1','2','3','254','255']:
+                    gateway_candidates.append(f"{parts[0]}.{parts[1]}.{parts[2]}.{last}")
 
-            # 方法1: 使用socket发送原始UDP广播
-            self.update_result("[1/6] Method 1: Socket UDP Broadcast...\n")
+            # 辅助函数：添加发现的服务器（过滤本机IP）
+            def add_server(ip, method, options=None):
+                if ip in self.local_ips:
+                    return
+                if ip not in self.dhcp_servers:
+                    self.dhcp_servers[ip] = {'method': method, 'options': options or {}}
+                    self.update_result((self.t('found_dhcp') % ip) + f" [{method}]\n")
+
+            # 方法1: socket广播
+            self.update_result("[1/9] Method 1: Socket UDP Broadcast...\n")
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
                 sock.settimeout(1)
-                
                 for i in range(count):
-                    if not self.is_scanning:
-                        break
+                    if not self.is_scanning: break
                     self.update_result((self.t('scan_round') % (i+1, count)) + "\n")
-                    
-                    # 构建DHCP Discover包
                     xid = random.randint(1, 0xFFFFFFFF)
-                    
-                    # BOOTP头部
-                    bootp = b''
-                    bootp += struct.pack('!B', 1)  # op
-                    bootp += struct.pack('!B', 1)  # htype
-                    bootp += struct.pack('!B', 6)  # hlen
-                    bootp += struct.pack('!B', 0)  # hops
-                    bootp += struct.pack('!I', xid)  # xid
-                    bootp += struct.pack('!H', 0)  # secs
-                    bootp += struct.pack('!H', 0x8000)  # flags: broadcast
-                    bootp += b'\x00' * 4  # ciaddr
-                    bootp += b'\x00' * 4  # yiaddr
-                    bootp += b'\x00' * 4  # siaddr
-                    bootp += b'\x00' * 4  # giaddr
-                    
-                    # chaddr (16字节)
-                    mac_bytes = bytes.fromhex(mac.replace(':', ''))
-                    bootp += mac_bytes + b'\x00' * (16 - len(mac_bytes))
-                    bootp += b'\x00' * 64  # sname
-                    bootp += b'\x00' * 128  # file
-                    
-                    # Magic cookie
-                    bootp += b'\x63\x82\x53\x63'
-                    
-                    # DHCP选项
-                    dhcp_options = b''
-                    dhcp_options += b'\x35\x01\x01'  # DHCP Discover
-                    dhcp_options += b'\x3d\x07\x01' + mac_bytes  # Client Identifier
-                    dhcp_options += b'\xff'  # End
-                    
-                    packet = bootp + dhcp_options
-                    packet = packet[:312] + b'\x00' * max(0, 312 - len(packet))
-                    
+                    packet = build_dhcp_packet(1, mac, xid)
                     for _ in range(5):
                         sock.sendto(packet, ('255.255.255.255', 67))
                         time.sleep(0.05)
-                    
-                    # 接收响应
                     try:
                         while True:
                             data, addr = sock.recvfrom(1024)
-                            if data and addr[0] not in found_ips:
-                                found_ips.add(addr[0])
-                                self.update_result((self.t('found_dhcp') % addr[0]) + "\n")
+                            if data and addr[0] not in self.dhcp_servers:
+                                add_server(addr[0], "Socket Broadcast")
                     except socket.timeout:
                         pass
-                    
                     time.sleep(0.5)
-                
                 sock.close()
             except Exception as e:
                 self.update_result(f"Method 1 error: {e}\n")
 
-            # 方法2: Scapy发送DHCP广播
-            self.update_result("[2/6] Method 2: Scapy DHCP Broadcast...\n")
+            # 方法2: Scapy广播 - 使用后台持续嗅探线程
+            self.update_result("[2/9] Method 2: Scapy DHCP Broadcast...\n")
+            
+            # 启动后台嗅探线程（持续运行，后续方法也使用同一队列）
+            pkt_queue = queue.Queue()
+            self.stop_event = threading.Event()
+            
+            def scapy_callback(pkt):
+                if DHCP in pkt and IP in pkt:
+                    ip_src = pkt[IP].src
+                    if ip_src not in self.dhcp_servers:
+                        pkt_queue.put(ip_src)
+            
+            self.sniff_thread = threading.Thread(
+                target=lambda: sniff(iface=actual_iface, filter=sniff_filter, 
+                                   prn=scapy_callback, store=0, 
+                                   stop_filter=lambda x: self.stop_event.is_set()),
+                daemon=True
+            )
+            self.sniff_thread.start()
+            
             for i in range(count):
-                if not self.is_scanning:
-                    break
+                if not self.is_scanning: break
                 self.update_result((self.t('scan_round') % (i+1, count)) + "\n")
-                
                 try:
                     xid = random.randint(1, 0xFFFFFFFF)
                     ether = Ether(dst="ff:ff:ff:ff:ff:ff", src=mac)
@@ -914,169 +820,274 @@ class DHCPScanner:
                     bootp = BOOTP(op=1, chaddr=mac2str(mac), xid=xid)
                     dhcp = DHCP(options=[("message-type", "discover"), ("end", b'')])
                     packet = ether/ip/udp/bootp/dhcp
-                    
                     for _ in range(5):
-                        sendp(packet, iface=actual_interface, verbose=False)
+                        sendp(packet, iface=actual_iface, verbose=False)
                         time.sleep(0.05)
-                    
-                    start_time = time.time()
-                    while time.time() - start_time < timeout:
-                        try:
-                            packets = sniff(iface=actual_interface, filter=sniff_filter, 
-                                          count=5, timeout=0.5, store=True)
-                            for pkt in packets:
-                                if DHCP in pkt and IP in pkt:
-                                    server_ip = pkt[IP].src
-                                    if server_ip not in found_ips:
-                                        found_ips.add(server_ip)
-                                        self.update_result((self.t('found_dhcp') % server_ip) + "\n")
-                        except:
-                            pass
-                        if not self.is_scanning:
-                            break
                 except Exception as e:
-                    self.update_result(f"Scapy error: {e}\n")
+                    self.update_result(f"Scapy send error: {e}\n")
                 
+                # 从队列中收集响应
+                start = time.time()
+                while time.time() - start < timeout:
+                    try:
+                        server_ip = pkt_queue.get_nowait()
+                        if server_ip not in self.dhcp_servers:
+                            add_server(server_ip, "Scapy Broadcast")
+                    except queue.Empty:
+                        break
+                    if not self.is_scanning: break
                 time.sleep(0.3)
+            
+            # 继续收集剩余响应
+            start = time.time()
+            while time.time() - start < 1:
+                try:
+                    server_ip = pkt_queue.get_nowait()
+                    if server_ip not in self.dhcp_servers:
+                        add_server(server_ip, "Scapy Broadcast")
+                except queue.Empty:
+                    break
 
-            # 方法3: Unicast到网关
+            # 方法3: Unicast到网关 (socket) - 修复macOS权限错误
             if local_ip != '0.0.0.0' and gateway_candidates:
-                self.update_result("[3/6] Method 3: Unicast to Gateway...\n")
+                self.update_result("[3/9] Method 3: Unicast to Gateway...\n")
                 for gw in gateway_candidates:
-                    if not self.is_scanning:
+                    if not self.is_scanning or len(self.dhcp_servers) > 0:
                         break
-                    if len(found_ips) > 0:
-                        break
-                    
                     try:
                         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                         sock.settimeout(1)
-                        
                         for i in range(2):
-                            if not self.is_scanning:
-                                break
+                            if not self.is_scanning: break
                             xid = random.randint(1, 0xFFFFFFFF)
-                            
-                            bootp = b''
-                            bootp += struct.pack('!B', 1)
-                            bootp += struct.pack('!B', 1)
-                            bootp += struct.pack('!B', 6)
-                            bootp += struct.pack('!B', 0)
-                            bootp += struct.pack('!I', xid)
-                            bootp += struct.pack('!H', 0)
-                            bootp += struct.pack('!H', 0)
-                            bootp += socket.inet_aton(local_ip)
-                            bootp += b'\x00' * 4
-                            bootp += socket.inet_aton(gw)
-                            bootp += b'\x00' * 4
-                            
-                            mac_bytes = bytes.fromhex(mac.replace(':', ''))
-                            bootp += mac_bytes + b'\x00' * (16 - len(mac_bytes))
-                            bootp += b'\x00' * 64
-                            bootp += b'\x00' * 128
-                            bootp += b'\x63\x82\x53\x63'
-                            
-                            dhcp_options = b'\x35\x01\x01\xff'
-                            packet = bootp + dhcp_options
-                            packet = packet[:312] + b'\x00' * max(0, 312 - len(packet))
-                            
+                            packet = build_dhcp_packet(1, mac, xid, ciaddr=local_ip, giaddr=gw)
                             sock.sendto(packet, (gw, 67))
                             time.sleep(0.1)
-                        
                         try:
                             while True:
                                 data, addr = sock.recvfrom(1024)
-                                if data and addr[0] not in found_ips:
-                                    found_ips.add(addr[0])
-                                    self.update_result((self.t('found_dhcp') % addr[0]) + "\n")
+                                if data and addr[0] not in self.dhcp_servers:
+                                    add_server(addr[0], "Unicast Socket")
                         except socket.timeout:
                             pass
-                        
                         sock.close()
+                    except PermissionError:
+                        self.update_result(f"Unicast socket not permitted on macOS, skipping.\n")
+                        break  # macOS上不再尝试其他网关
                     except Exception as e:
                         self.update_result(f"Unicast error: {e}\n")
 
             # 方法4: Scapy Unicast到网关
             if local_ip != '0.0.0.0' and gateway_candidates:
-                self.update_result("[4/6] Method 4: Scapy Unicast to Gateway...\n")
+                self.update_result("[4/9] Method 4: Scapy Unicast to Gateway...\n")
                 for gw in gateway_candidates:
-                    if not self.is_scanning:
+                    if not self.is_scanning or len(self.dhcp_servers) > 0:
                         break
-                    if len(found_ips) > 0:
-                        break
-                    
                     try:
                         for i in range(2):
-                            if not self.is_scanning:
-                                break
+                            if not self.is_scanning: break
                             xid = random.randint(1, 0xFFFFFFFF)
                             ether = Ether(dst="ff:ff:ff:ff:ff:ff", src=mac)
                             ip = IP(src=local_ip, dst=gw)
                             udp = UDP(sport=68, dport=67)
                             bootp = BOOTP(op=1, chaddr=mac2str(mac), xid=xid, ciaddr=local_ip, giaddr=gw)
                             dhcp = DHCP(options=[("message-type", "discover"), ("end", b'')])
-                            packet = ether/ip/udp/bootp/dhcp
-                            
-                            sendp(packet, iface=actual_interface, verbose=False)
+                            sendp(ether/ip/udp/bootp/dhcp, iface=actual_iface, verbose=False)
                             time.sleep(0.1)
-                        
-                        # 接收
-                        start_time = time.time()
-                        while time.time() - start_time < 2:
+                        # 从共享队列中收集响应
+                        start = time.time()
+                        while time.time() - start < 2:
                             try:
-                                packets = sniff(iface=actual_interface, filter=sniff_filter, 
-                                              count=5, timeout=0.5, store=True)
-                                for pkt in packets:
-                                    if DHCP in pkt and IP in pkt:
-                                        server_ip = pkt[IP].src
-                                        if server_ip not in found_ips:
-                                            found_ips.add(server_ip)
-                                            self.update_result((self.t('found_dhcp') % server_ip) + "\n")
-                            except:
-                                pass
+                                server_ip = pkt_queue.get_nowait()
+                                if server_ip not in self.dhcp_servers:
+                                    add_server(server_ip, "Scapy Unicast")
+                            except queue.Empty:
+                                break
+                            if not self.is_scanning: break
                     except Exception as e:
                         self.update_result(f"Scapy unicast error: {e}\n")
 
-            # 方法5: ARP探测网关
-            if local_ip != '0.0.0.0' and gateway_candidates:
-                self.update_result("[5/6] Method 5: ARP Gateway Discovery...\n")
+            # 方法5: ARP扫描（网关 + 子网）
+            if local_ip != '0.0.0.0':
+                self.update_result("[5/9] Method 5: ARP Scan (Gateway + Subnet)...\n")
+                parts = local_ip.split('.')
+                prefix = f"{parts[0]}.{parts[1]}.{parts[2]}"
+                
+                # 首先探测已知网关候选
                 for gw in gateway_candidates:
-                    if not self.is_scanning:
+                    if not self.is_scanning or len(self.dhcp_servers) > 0:
                         break
-                    if len(found_ips) > 0:
-                        break
-                    
                     try:
-                        arp_request = Ether(dst="ff:ff:ff:ff:ff:ff", src=mac)/ARP(op=1, pdst=gw, psrc=local_ip)
+                        arp = Ether(dst="ff:ff:ff:ff:ff:ff", src=mac)/ARP(op=1, pdst=gw, psrc=local_ip)
                         for _ in range(3):
-                            sendp(arp_request, iface=actual_interface, verbose=False)
+                            sendp(arp, iface=actual_iface, verbose=False)
                             time.sleep(0.1)
                     except:
                         pass
-
-            # 方法6: UDP探测67端口
-            self.update_result("[6/6] Method 6: UDP Port 67 Scan...\n")
-            if local_ip != '0.0.0.0':
-                ip_parts = local_ip.split('.')
-                subnet_prefix = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}"
                 
+                # 然后扫描本地子网
                 for i in range(1, 255, 10):
-                    if not self.is_scanning:
-                        break
-                    if len(found_ips) > 0:
-                        break
-                    
-                    target_ip = f"{subnet_prefix}.{i}"
+                    if not self.is_scanning: break
+                    target = f"{prefix}.{i}"
+                    arp = Ether(dst="ff:ff:ff:ff:ff:ff", src=mac)/ARP(op=1, pdst=target, psrc=local_ip)
+                    sendp(arp, iface=actual_iface, verbose=False, count=2)
+                    time.sleep(0.1)
+
+            # 方法6: DHCP Inform (静态IP)
+            self.update_result("[6/9] Method 6: DHCP Inform...\n")
+            if local_ip != '0.0.0.0':
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    sock.settimeout(2)
+                    xid = random.randint(1, 0xFFFFFFFF)
+                    packet = build_dhcp_packet(8, mac, xid, ciaddr=local_ip, yiaddr='0.0.0.0')
+                    for _ in range(3):
+                        sock.sendto(packet, ('255.255.255.255', 67))
+                        time.sleep(0.1)
                     try:
-                        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                        sock.settimeout(0.3)
-                        sock.sendto(b'\x01', (target_ip, 67))
-                        sock.close()
-                    except:
+                        while True:
+                            data, addr = sock.recvfrom(1024)
+                            if data and addr[0] not in self.dhcp_servers:
+                                add_server(addr[0], "DHCP Inform")
+                    except socket.timeout:
                         pass
+                    sock.close()
+                except Exception as e:
+                    self.update_result(f"Inform error: {e}\n")
 
-            self.dhcp_servers = list(found_ips)
+            # 方法7: DHCP Renewal
+            self.update_result("[7/9] Method 7: DHCP Renewal...\n")
+            if local_ip != '0.0.0.0':
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    sock.settimeout(2)
+                    xid = random.randint(1, 0xFFFFFFFF)
+                    packet = build_dhcp_packet(3, mac, xid, ciaddr=local_ip, yiaddr='0.0.0.0')
+                    for _ in range(3):
+                        sock.sendto(packet, ('255.255.255.255', 67))
+                        time.sleep(0.1)
+                    try:
+                        while True:
+                            data, addr = sock.recvfrom(1024)
+                            if data and addr[0] not in self.dhcp_servers:
+                                add_server(addr[0], "DHCP Renewal")
+                    except socket.timeout:
+                        pass
+                    sock.close()
+                except Exception as e:
+                    self.update_result(f"Renewal error: {e}\n")
 
+            # 方法8: 伪装裸设备（使用Scapy，跨平台）- 始终启用
+            self.update_result("[8/9] Method 8: Naked Device (Raw)...\n")
+            try:
+                xid = random.randint(1, 0xFFFFFFFF)
+                ether = Ether(dst="ff:ff:ff:ff:ff:ff", src=mac)
+                ip = IP(src="0.0.0.0", dst="255.255.255.255")
+                udp = UDP(sport=68, dport=67)
+                bootp = BOOTP(op=1, chaddr=mac2str(mac), xid=xid)
+                dhcp = DHCP(options=[("message-type", "discover"), ("end", b'')])
+                packet = ether/ip/udp/bootp/dhcp
+                for _ in range(5):
+                    sendp(packet, iface=actual_iface, verbose=False)
+                    time.sleep(0.05)
+                # 从共享队列收集响应
+                start = time.time()
+                while time.time() - start < 2:
+                    try:
+                        server_ip = pkt_queue.get_nowait()
+                        if server_ip not in self.dhcp_servers:
+                            add_server(server_ip, "Naked Device")
+                    except queue.Empty:
+                        break
+                    if not self.is_scanning: break
+            except Exception as e:
+                self.update_result(f"Naked device error: {e}\n")
+
+            # 方法9: DHCP Relay 检测
+            self.update_result("[9/9] Method 9: DHCP Relay Detection...\n")
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.settimeout(1)
+                xid = random.randint(1, 0xFFFFFFFF)
+                packet = build_dhcp_packet(1, mac, xid)
+                for _ in range(5):
+                    sock.sendto(packet, ('255.255.255.255', 67))
+                    time.sleep(0.05)
+                try:
+                    while True:
+                        data, addr = sock.recvfrom(1024)
+                        if data and len(data) >= 28:
+                            giaddr = data[24:28]
+                            if giaddr != b'\x00\x00\x00\x00':
+                                relay_ip = socket.inet_ntoa(giaddr)
+                                self.update_result(f"[DHCP Relay] Detected at: {relay_ip}\n")
+                                break
+                except socket.timeout:
+                    pass
+                sock.close()
+            except Exception as e:
+                self.update_result(f"Relay detection error: {e}\n")
+
+            # VLAN探测 - 发送DHCP Discover到候选网关并监听响应
+            self.update_result("\n[VLAN Detection] Scanning common VLAN gateways...\n")
+            
+            # 启动短暂的后台嗅探线程
+            vlan_queue = queue.Queue()
+            vlan_stop = threading.Event()
+            
+            def vlan_callback(pkt):
+                if DHCP in pkt and IP in pkt:
+                    ip_src = pkt[IP].src
+                    if ip_src not in self.dhcp_servers:
+                        vlan_queue.put(ip_src)
+            
+            vlan_sniff_thread = threading.Thread(
+                target=lambda: sniff(iface=actual_iface, filter=sniff_filter,
+                                    prn=vlan_callback, store=0,
+                                    stop_filter=lambda x: vlan_stop.is_set()),
+                daemon=True
+            )
+            vlan_sniff_thread.start()
+            
+            # 候选VLAN网关列表
+            common_gws = ['10.0.0.1', '10.0.1.1', '10.0.2.1', '172.16.0.1', '172.16.1.1', 
+                         '172.16.2.1', '192.168.0.1', '192.168.1.1', '192.168.2.1', 
+                         '10.10.0.1', '10.10.1.1']
+            
+            for gw in common_gws:
+                if not self.is_scanning: break
+                if len(self.dhcp_servers) > 0:
+                    break
+                try:
+                    # 发送DHCP Discover到网关
+                    xid = random.randint(1, 0xFFFFFFFF)
+                    ether = Ether(dst="ff:ff:ff:ff:ff:ff", src=mac)
+                    ip = IP(src="0.0.0.0", dst=gw)
+                    udp = UDP(sport=68, dport=67)
+                    bootp = BOOTP(op=1, chaddr=mac2str(mac), xid=xid)
+                    dhcp = DHCP(options=[("message-type", "discover"), ("end", b'')])
+                    packet = ether/ip/udp/bootp/dhcp
+                    sendp(packet, iface=actual_iface, verbose=False)
+                    time.sleep(0.1)
+                except:
+                    pass
+            
+            # 监听响应（使用 timeout 参数的一半，捕获跨VLAN中继响应）
+            vlan_listen_time = max(timeout / 2, 2)
+            time.sleep(vlan_listen_time)
+            while not vlan_queue.empty():
+                server_ip = vlan_queue.get()
+                if server_ip not in self.dhcp_servers:
+                    add_server(server_ip, "VLAN Discovery")
+            
+            vlan_stop.set()
+            vlan_sniff_thread.join(timeout=1)
+            self.update_result("  VLAN scanning completed\n")
+
+            # 扫描完成
             if self.is_scanning:
                 self.update_result("\n" + (self.t('scan_complete') % len(self.dhcp_servers)) + "\n")
                 if len(self.dhcp_servers) > 1:
@@ -1095,159 +1106,135 @@ class DHCPScanner:
 
         except Exception as e:
             self.update_result((self.t('scan_error') % e) + "\n")
-
         finally:
+            # 停止嗅探线程
+            if self.sniff_thread and self.sniff_thread.is_alive():
+                if self.stop_event:
+                    self.stop_event.set()
+                try:
+                    self.sniff_thread.join(timeout=1)
+                except:
+                    pass
+            self.sniff_thread = None
+            self.stop_event = None
             self.scan_completed()
 
     def start_scan(self):
-        """开始扫描"""
-        interface = self.get_selected_interface()
-        if not interface:
+        iface = self.get_selected_interface()
+        if not iface:
             messagebox.showwarning(self.t('warning'), self.t('select_interface'))
             return
-
-        # 更新UI
         self.is_scanning = True
         self.scan_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.result_text.config(state=tk.NORMAL)
         self.result_text.delete(1.0, tk.END)
+        self.result_text.config(state=tk.DISABLED)
         self.server_count_var.set("0")
         self.update_status(self.t('scanning'))
-
-        # 保存设置
         self.config['scan_count'] = self.scan_count_var.get()
         self.config['timeout'] = self.timeout_var.get()
         self.save_config()
-
-        # 启动扫描
         self.scan_thread = threading.Thread(
             target=self.send_dhcp_discover,
-            args=(interface, self.scan_count_var.get(), self.timeout_var.get()),
+            args=(iface, self.scan_count_var.get(), self.timeout_var.get()),
             daemon=True
         )
         self.scan_thread.start()
 
     def stop_scan(self):
-        """停止扫描"""
         self.is_scanning = False
         self.update_status(self.t('stopping'))
         self.stop_btn.config(state=tk.DISABLED)
 
     def scan_completed(self):
-        """扫描完成后的UI更新"""
         self.is_scanning = False
         self.scan_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.server_count_var.set(str(len(self.dhcp_servers)))
         self.update_status(self.t('completed'))
 
-    def update_status(self, message):
-        """更新状态信息"""
-        self.status_var.set(message)
+    def update_status(self, msg):
+        self.status_var.set(msg)
 
-    def update_result(self, message):
-        """更新结果文本"""
+    def update_result(self, msg):
         self.result_text.config(state=tk.NORMAL)
-        self.result_text.insert(tk.END, message)
+        self.result_text.insert(tk.END, msg)
         self.result_text.see(tk.END)
         self.result_text.config(state=tk.DISABLED)
         self.root.update_idletasks()
 
+# ---------------------------- 主程序入口 ---------------------------------
 def check_npcap_installed():
-    """检查npcap是否已安装"""
     if platform.system() != 'Windows':
         return True
-    
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\npcap")
         winreg.CloseKey(key)
         return True
-    except WindowsError:
-        pass
-    
-    try:
-        npcap_path = r"C:\Windows\System32\Npcap"
-        if os.path.exists(npcap_path):
-            return True
     except:
-        pass
-    
+        try:
+            if os.path.exists(r"C:\Windows\System32\Npcap"):
+                return True
+        except:
+            pass
     return False
 
 def install_npcap():
-    """运行npcap安装程序"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    npcap_installer = os.path.join(script_dir, "npcap-1.87.exe")
-    
-    if os.path.exists(npcap_installer):
+    installer = os.path.join(script_dir, "npcap-1.87.exe")
+    if os.path.exists(installer):
         try:
-            import ctypes
-            ret = ctypes.windll.shell32.ShellExecuteW(
-                None, "open", npcap_installer, None, script_dir, 1
-            )
-            if ret > 32:
-                return True
-        except Exception as e:
-            print(f"运行npcap安装程序失败: {e}")
+            ret = ctypes.windll.shell32.ShellExecuteW(None, "open", installer, None, script_dir, 1)
+            return ret > 32
+        except:
+            pass
     return False
 
 def main():
-    # 检查系统
     system = platform.system()
+    if system == 'Windows' and not check_npcap_installed():
+        if messagebox.askyesno("Npcap未安装", "Npcap是本程序运行的必要组件。\n\n是否立即安装Npcap?"):
+            if install_npcap():
+                messagebox.showinfo("提示", "Npcap安装程序已启动。\n\n请完成安装后重新运行本程序。")
+            else:
+                messagebox.showerror("错误", "无法启动Npcap安装程序。\n请手动运行同目录下的 npcap-1.87.exe")
+        sys.exit(0)
 
-    # npcap检查(仅Windows)
-    if system == 'Windows':
-        if not check_npcap_installed():
-            result = messagebox.askyesno(
-                "Npcap未安装",
-                "Npcap是本程序运行的必要组件。\n\n是否立即安装Npcap?"
-            )
-            if result:
-                if install_npcap():
-                    messagebox.showinfo(
-                        "提示",
-                        "Npcap安装程序已启动。\n\n请完成安装后重新运行本程序。"
-                    )
-                else:
-                    messagebox.showerror(
-                        "错误",
-                        "无法启动Npcap安装程序。\n请手动运行同目录下的 npcap-1.87.exe"
-                    )
-            sys.exit(0)
-
-    # 管理员权限运行
+    # 管理员权限
     try:
         if system == 'Windows':
-            import ctypes
             is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-        else:  # Linux, macOS
-            import os
+        else:
             is_admin = os.geteuid() == 0
     except:
         is_admin = False
-
     if not is_admin:
         request_admin()
     else:
-        # 检查库
         try:
             import scapy
             import netifaces
-        except ImportError as e:
-
+        except ImportError:
             return
-
-        # 主窗口
-        root = tk.Tk()
-
-        # 设置窗口最小大小
+        if system == 'Windows':
+            import ttkbootstrap as ttkb
+            try:
+                import winreg
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
+                build, _ = winreg.QueryValueEx(key, "CurrentBuild")
+                winreg.CloseKey(key)
+                is_win10 = int(build) >= 10240
+            except:
+                is_win10 = False
+            theme = "darkly" if (is_win10 and get_windows_theme() == 'dark') else "flatly"
+            root = ttkb.Window(themename=theme)
+        else:
+            root = tk.Tk()
         root.minsize(800, 700)
-
-        # 主循环
         app = DHCPScanner(root)
         root.mainloop()
 
 if __name__ == "__main__":
-    main()
+    main()  

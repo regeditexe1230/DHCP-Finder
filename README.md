@@ -5,8 +5,8 @@ This program takes more than ten seconds to start, which is normal. It is elevat
 This tool only supports wired networks; scanning wireless networks is meaningless     
     
 This software cannot be used in certain network environments:    
->1. Your computer is using a static IP
->2. The static IP you set on your computer is not within your router's address pool
+>1.Your computer is using a static IP
+>2.The static IP you set on your computer is not within your router's address pool
     
 If you have any suggestions or feedback, please contact me    
 >QQ:2874454570      

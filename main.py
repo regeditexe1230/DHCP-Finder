@@ -46,7 +46,6 @@ import json
 import ctypes
 import subprocess
 
-# ---------------------------- 国际化文本 ---------------------------------
 LANG = {
     'zh': {
         'title': 'DHCP扫描器',
@@ -198,7 +197,6 @@ LANG = {
     }
 }
 
-# ---------------------------- 辅助函数 ---------------------------------
 def get_windows_theme():
     if platform.system() != 'Windows':
         return None
@@ -298,7 +296,6 @@ def build_dhcp_packet(msg_type, mac, xid=None, ciaddr='0.0.0.0', yiaddr='0.0.0.0
         packet += b'\x00' * (312 - len(packet))
     return packet
 
-# ---------------------------- 主程序类 ---------------------------------
 class DHCPScanner:
     def __init__(self, root):
         self.root = root
@@ -683,7 +680,6 @@ class DHCPScanner:
                 return values[0]
         return None
 
-    # ---------------------------- 扫描核心 ---------------------------------
     def send_dhcp_discover(self, interface, count=3, timeout=5):
         self.dhcp_servers = {}
         sniff_filter = "udp port 67 or udp port 68"
@@ -1164,7 +1160,7 @@ class DHCPScanner:
         self.result_text.config(state=tk.DISABLED)
         self.root.update_idletasks()
 
-# ---------------------------- 主程序入口 ---------------------------------
+
 def check_npcap_installed():
     if platform.system() != 'Windows':
         return True

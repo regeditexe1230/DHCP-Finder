@@ -46,6 +46,7 @@ import json
 import ctypes
 import subprocess
 
+# ---------------------------- 国际化文本 ---------------------------------
 LANG = {
     'zh': {
         'title': 'DHCP扫描器',
@@ -197,6 +198,7 @@ LANG = {
     }
 }
 
+# ---------------------------- 辅助函数 ---------------------------------
 def get_windows_theme():
     if platform.system() != 'Windows':
         return None
@@ -1159,7 +1161,6 @@ class DHCPScanner:
         self.result_text.see(tk.END)
         self.result_text.config(state=tk.DISABLED)
         self.root.update_idletasks()
-
 
 def check_npcap_installed():
     if platform.system() != 'Windows':

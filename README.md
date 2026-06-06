@@ -16,3 +16,6 @@ If you have any suggestions or feedback, please contact me
 如果你有任何建议或者反馈请联系我    
 >QQ:2874454570      
 >Email:regeditexe@outlook.com      
+
+donate:https://ifdian.net/a/regeditexe             
+捐赠:https://ifdian.net/a/regeditexe
